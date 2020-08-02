@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar  4 17:27:13 2019
+"""
+
+"""TV Kernel K-means"""
+
+_author__ = 'gilles[dot]gasso[at]insa-rouen[dot]fr'
+# Kernel k-means is derived from https://gist.github.com/mblondel/6230787 by Mathieu Blondel, under BSD 3 clause license
+# GKA is derived from https://tslearn.readthedocs.io/en/latest/_modules/tslearn/clustering.html by Romain Tavenard
+
+import autograd.numpy as np
+#import cvxpy as cvx
+import sys
+import cupy as cp
+#from qpsolvers import solve_qp
+
+from sklearn.base import BaseEstimator, ClusterMixin
+from sklearn.metrics.pairwise import pairwise_kernels
+#from sklearn.utils import check_random_state
+from sklearn.metrics import silhouette_score as sklearn_silhouette_score
+#import sklearn.cluster.k_means as k_means
+from sklearn.cluster.k_means_ import k_means
+from scipy.sparse import spdiags
+
+from autograd.numpy.linalg import norm as norm
+
+from pymanopt.manifolds import Stiefel
+from pymanopt import Problem
+from pymanopt.solvers import SteepestDescent, TrustRegions, ConjugateGradient
+
+import pdb
+
+#%%
+class EmptyClusterError(Exception):
+    def __init__(self, message=""):
+        super(EmptyClusterError, self).__init__()
+        self.message = message
+
+    def __str__(self):
+        if len(self.message) > 0:
+            suffix = " (%s)" % self.message
+        else:
+            suffix = ""
+        return "Cluster assignments lead to at least one empty cluster" + suffix
+
+
+def _check_no_empty_cluster(labels, n_clusters):
+    """Check that all clusters have at least one sample assigned.
+    Examples
+    --------
+    >>> labels = numpy.array([1, 1, 2, 0, 2])
+    >>> _check_no_empty_cluster(labels, 3)
+    >>> _check_no_empty_cluster(labels, 4)  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+    EmptyClusterError: Cluster assignments lead to at least one empty cluster
+    """
+
+    for k in range(n_clusters):
+        if np.sum(labels == k) == 0:
+            raise EmptyClusterError    
+#%% MKL clustering
+class TVKernelKMeans(BaseEstimator, ClusterMixin):
+    """
+    TV Kernel K-means
+    """
+
+    def __init__(self, n_clusters=3,  random_state=None, kernel="linear", param=None,  
+                 reg_param=1, verbose=0, max_iter=500, n_init=5, init_H='spectral', admm_rho=1):
+        
+        self.n_clusters = n_clusters
+        self.max_iter = max_iter
+        self.n_init = n_init
+        self.init_H = init_H #whether H should be initialized 
+        self.random_state = random_state
+        self.kernel = kernel
+        self.param = param
+        self.reg_param = reg_param
+        self.verbose = verbose
+        self.admm_rho = admm_rho
+        self.ridge_param = 1e-6  # reg term for kernel matrix
+        
+    
+    
+    def _get_kernel(self, X, Y=None):
+        if Y is None:
+            Y = X
+            
+            if self.kernel == "linear":
+                return pairwise_kernels(X, Y, metric=self.kernel)
+            else:
+                return pairwise_kernels(X, Y, metric=self.kernel, filter_params=True, **self.param)
+            
+    @staticmethod
+    def _set_times_series_list_as_matrices(list_ts):
+        """
+        list_ts: list of n_a arrays. Each array is of dimension N_i x d (Ni time series of lenght d)
+        outputs: 
+            X: array of dim N x d with ..math: N = \sum_{i}^{n_a} N_i
+            vect_len_ts: vector of dim n_a with vdim = [N1, N2, ..., N_n_a]
+        """
+        n_a = len(list_ts)
+        vect_len_ts = np.asarray([list_ts[i].shape[0] for i in range(n_a)])
+        X = np.empty((vect_len_ts.sum(), list_ts[0].shape[1]), dtype = float)
+        ndata = 0
+        for i in range(n_a):
+            X[ndata:vect_len_ts[:i+1].sum(), :] = list_ts[i]
+            ndata += vect_len_ts[i]
+            
+            
+        return X, vect_len_ts
+    
+    @staticmethod
+    def _columwise_norm(M, ell):
+        """
+        inputs:
+            M: array of dimension n x p
+            ell: the norm to apply
+        outputs: 
+            val: the sum of ell-norm of M's columns
+            ..math: val = \sum_{j=1}^{p} \|M(:,j)\|_\ell
+        """
+        val = 0
+        for j in range(M.shape[1]):
+            val += norm(M[:,j], ell)
+
+        return val
+    
+    def _objective_function(self, K):
+        """
+        inputs:
+            K: kernel matrix (pairwise similarity distance matrix)
+            D: block differentiation matrix
+        outputs: 
+            obj_val: objective value J(H)
+            ..math: J(H) = 1/T(tr(K) - tr(H H^\top K)) + \frac{\lambda}{n_0} \sum_{t=1}^{T-1}\|w_t \|_1
+        """
+        ell = 1  # ell-norm
+        T = K.shape[0]
+        obj_val = (np.trace(K) - np.trace(self.H.T@K@self.H))/T
+        #H_top_times_D = (self.H.transpose())@D
+        obj_val += self.reg_param*self._columwise_norm(self.W, ell)
+            
+        return obj_val
+    
+    
+    @staticmethod
+    def _soft_shrinkage(v, kappa):
+        return np.maximum(0.,v-kappa)-np.maximum(0.,-v-kappa)
+        
+    
+    @staticmethod
+    def _generate_block_differentiation_matrix(vect_len_ts):
+        
+        vect_size_tv = vect_len_ts - 1
+        D = np.zeros((vect_len_ts.sum(), vect_size_tv.sum()))
+        diags = np.array([0, -1])
+        ndata = 0
+        n_size_tv = 0
+        for i, len_ts in enumerate(vect_len_ts):
+                
+            index_row = np.arange(ndata, vect_len_ts[:i+1].sum())
+            index_col = np.arange(n_size_tv, vect_size_tv[:i+1].sum())
+            
+            e = np.ones(len_ts)
+            Dl = spdiags(np.vstack((e, -e)), diags, len_ts, len_ts-1)
+            D[np.ix_(index_row, index_col)] = Dl.toarray()
+                        
+            n_size_tv += vect_size_tv[i]
+            ndata += vect_len_ts[i]
+            
+        return D
+        
+        
+    def _fit_spectral_embedding(self, K, vect_len_ts):
+        """
+        solve the spectral problem using ADMM
+        ..math: \min_{H} tr(K) - tr(H H^\top K) + \frac{\lambda}{n_0} \sum_{t=1}^{T-1}\|H^\top d_t \|_1
+        ..math: s.t. H^\top H = I
+        ..math: d_t^\top = \[0 \cdots 0 1 -1 0 \cdots 0 \]
+        """
+        MAX_ITER = 500
+        ABSTOL   = 1e-2
+        RELTOL   = 1e-4
+        
+        self.vect_len_ts = vect_len_ts
+        
+        # Saving state
+        h = {}
+        h['objval']     = np.zeros(MAX_ITER)
+        h['r_norm']     = np.zeros(MAX_ITER)
+        h['s_norm']     = np.zeros(MAX_ITER)
+        h['eps_pri']    = np.zeros(MAX_ITER)
+        h['eps_dual']   = np.zeros(MAX_ITER)
+        
+        if self.verbose:
+            print('{:6} | {:7} | {:7} | {:7} | {:7} | {:12}\n'.
+                  format('iter','r norm', 'eps pri', 's norm', 'eps dual', 'objective'))
+        
+        # block differentiation matrix
+        D = self._generate_block_differentiation_matrix(vect_len_ts)
+        
+        # vect containing respective lengths of Y and W
+        vect_size_tv = vect_len_ts - 1
+        
+        #number of samples
+        nsamples = vect_len_ts.sum()
+        
+        # kappa: proximal parameter
+        kappa = self.reg_param/self.admm_rho
+        
+        # constants for stopping tolerance
+        c_prim = np.sqrt(self.n_clusters*vect_len_ts.sum())
+        c_dual = np.sqrt(self.n_clusters*vect_size_tv.sum())
+        
+        print('obj = {:10.2f}'.format(self._objective_function(K)))
+
+        
+        for k in range(MAX_ITER):
+            
+            #pdb.set_trace()
+            Wold = np.copy(self.W)
+            #Hold = np.copy(self.H)
+            Yold = np.copy(self.Y)
+            rho = self.admm_rho
+            def Hstep_cost_function(H):
+                """
+                cost function used by pymanopt to solve the stiefel manifold problem
+                ..math: \min_H - trace(H^\top*K*H)/T + \frac{\rho}{2}  \|H^\top D - W + Y \|_F^2
+                ..math: s.t. H^\top H = I
+                ..math: T (number of samples)
+                """            
+                U = Wold - Yold
+                #cost = -np.trace(H.T@K@H) + (self.admm_rho/2)*(norm(H.T@D - Wold + self.Y, 'fro')**2)           
+                cost = -np.trace(H.T@K@H)/nsamples + (rho/2)*np.trace((H.T@D - U)@(H.T@D-U).T)           
+                return cost
+            
+            def egrad(H):
+                U = Wold - Yold
+                grad_e = -2*(K@H)/nsamples + rho*D@((H.T@D - U).T)
+                return grad_e
+            
+            # ================ H-Update =============
+            manifold = Stiefel(vect_len_ts.sum(), self.n_clusters)
+            problem = Problem(manifold=manifold, cost=Hstep_cost_function, verbosity = 0)
+            #solver = SteepestDescent(maxtime=float('inf'),mingradnorm=1e-8, 
+                       # minstepsize=1e-16, maxiter = self.max_iter) #instantiation pymanopt
+            #solver = TrustRegions()
+            solver = ConjugateGradient()
+            self.H = np.asarray(solver.solve(problem))
+            #print('norm variation of H = {}'.format(norm(Hold-self.H, 'fro')))
+            #print('H : variation on obj = {}'.format(-np.trace(Hold.T@K@Hold)/nsamples + np.trace(self.H.T@K@self.H)/nsamples))
+            
+            #================= W - update =============
+            H_top_times_D = (self.H.T)@D
+            target_ell = H_top_times_D + self.Y
+            for t in range(self.W.shape[1]):
+                self.W[:,t] = self._soft_shrinkage(target_ell[:,t], kappa)
+                #print(norm(self.W[:,t] - target_ell[:,t]))
+                #print(norm(self.W[:,t] - Wold[:,t]))
+            
+            #print('norm variation of W = {}'.format(norm(Wold-self.W, 'fro')))
+            #print('W: variation on obj = {}'.format(self._columwise_norm(Wold, 1) - self._columwise_norm(self.W, 1)))
+            
+            
+            #================ Y -Updates =============
+            self.Y = np.copy(self.Y) + (H_top_times_D - self.W)
+            #print('norm variation of Y = {}'.format(norm(Yold-self.Y, 'fro')))
+            #print('obj = {:10.2f}'.format(self._objective_function(K)))
+            # ============ history ====================
+            h['objval'][k]   = self._objective_function(K)
+            h['r_norm'][k]   = norm(H_top_times_D - self.W, 'fro')
+            h['s_norm'][k]   = self.admm_rho*norm(D@(Wold - self.W).transpose(), 'fro')
+            norm_Htop_D      = norm(H_top_times_D, 'fro')
+            norm_D_Ytop      = self.admm_rho*norm(D@self.Y.transpose(), 'fro')    
+            h['eps_pri'][k]  = c_prim*ABSTOL + RELTOL*np.max([norm(self.W, 'fro'), norm_Htop_D])
+            h['eps_dual'][k] = c_dual*ABSTOL + RELTOL*norm_D_Ytop
+            
+            # verbose
+            if self.verbose:
+                print('{:6} | {:5.3f} | {:5.3f} | {:5.3f} | {:5.3} | {:10.2f}\n'.format(k, h['r_norm'][k], h['eps_pri'][k],
+                      h['s_norm'][k], h['eps_dual'][k], h['objval'][k]))
+                
+            # check convergence
+            if (h['r_norm'][k] < h['eps_pri'][k]) and (h['s_norm'][k] < h['eps_dual'][k]):
+                break
+            
+        self.history = h
+        return self
+                
+    
+    def fit(self, list_ts):
+        
+        X, vect_len_ts = self._set_times_series_list_as_matrices(list_ts)
+        
+        K = self._get_kernel(X)
+        
+        # init parameters
+        if self.init_H == 'spectral':
+            (U, _, _) = np.linalg.svd(X) #initialize H with the spectral
+            self.H = U[:, :self.n_clusters]
+        elif self.init_H == 'zeros':
+            self.H = np.zeros((vect_len_ts.sum(), self.n_clusters))
+        else:
+            raise "Unsupported initialization"
+        
+        #self.W = np.zeros((self.n_clusters, (vect_len_ts-1).sum()))
+        #pdb.set_trace()
+        #D = self._generate_block_differentiation_matrix(vect_len_ts)
+        self.W = np.transpose(self.H)@self._generate_block_differentiation_matrix(vect_len_ts)
+        self.Y = np.zeros((self.n_clusters, (vect_len_ts-1).sum()))
+        
+        
+        self._fit_spectral_embedding(K, vect_len_ts)
+            
+        #self.maps_centers_, self.labels_, _ = k_means(self.H, self.n_clusters, 
+        #                                              self.random_state, self.n_init)
+        
+        self.maps_centers_, self.labels_, _ = k_means(self.H, n_clusters=self.n_clusters, sample_weight=None, 
+                init='k-means++', precompute_distances='auto', n_init=self.n_init)
+        
+        self.K_fit_ = K
+        
+        return self
+
+    
+
+    def fit_predict(self, list_ts):
+        
+        self.fit(list_ts)
+        return self.labels_
+    
+    def silhouette_score(self, list_ts, labels=None):
+        if labels is None:
+             if hasattr(self, 'labels_'):
+                 labels = self.labels_
+             else:
+                 raise ValueError("Provide cluster labels of sample matrix X")
+                 
+        self.fit(list_ts)
+        dist = np.zeros((self.H.shape[0], self.n_clusters))
+        dist = pairwise_kernels(self.H, self.maps_centers_, metric="linear", filter_params=True)
+        return sklearn_silhouette_score(dist, labels, metric='precomputed')
+    
+    
+    
+    
+    
+    
+def Silhouette(X,n_clusters):
+    s=np.array([])
+    for n_clusters in range(2,n_clusters):
+     
+     tvkms = TVKernelKMeans(n_clusters, random_state=None, kernel="linear", param=None,
+                       init_H='zeros', reg_param=1/250, verbose=1, admm_rho=1e1)
+     
+     tvkms.fit(X)
+  
+     dist = np.zeros((tvkms.H.shape[0], tvkms.n_clusters))
+     dist = pairwise_kernels(tvkms.H, tvkms.maps_centers_, metric="linear", filter_params=True)
+    # wcss.append(tvkms.inertia_)
+    # centroids = kmeans.cluster_centers_
+     r=sklearn_silhouette_score(dist,tvkms.labels_)
+    #  r=silhouette_samples_memory_saving(X, labels, metric='euclidean')
+     s=np.append(s,r)
+    return(s)
+    
+#%%    def _Hstep_cost_function(self, K):
+#            """
+#            cost function used by pymanopt to solve the stiefel manifold problem
+#            ..math: \min_H - trace(H^\top*K*H) + \frac{\rho}{2}  \|H^\top D - W + Y \|_F^2
+#            ..math: s.t. H^\top H = I
+#            """
+#            
+#            vect_len_ts = self. vect_len_ts
+#            # vect containing respective lengths of Y and W
+#            vect_size_tv = vect_len_ts - 1
+#            
+#            # cost function
+#            cost = -np.trace((self.H.T)@K@(self.H))
+#            
+#            # to form the differentiation matrix
+#            diags = np.array([0, -1])
+#            ndata = 0
+#            n_size_tv = 0
+#            for i, len_ts in enumerate(vect_len_ts):
+#                    
+#                index = np.arange(n_size_tv, vect_size_tv[:i+1].sum())
+#                e = np.ones(len_ts)
+#                Dl = spdiags(np.vstack((e, -e)), diags, len_ts, len_ts-1)
+#                Hl_top_times_Dl = np.transpose(self.H[ndata:vect_len_ts[:i+1].sum(), :])@Dl
+#                U_ell = Hl_top_times_Dl - self.W[:, index] + self.Y[:, index]
+#                       
+#                cost += self.admm_rho*norm(U_ell, 'fro')/2
+#                
+#                n_size_tv += vect_size_tv[i]
+#                ndata += vect_len_ts[i]
+#            
+#            return cost
+        
+#%%
+#def _fit_spectral_embedding(self, K, vect_len_ts):
+#        """
+#        solve the spectral problem using ADMM
+#        ..math: \min_{H} tr(K) - tr(H H^\top K) + \frac{\lambda}{n_0} \sum_{t=1}^{T-1}\|H^\top d_t \|_1
+#        ..math: s.t. H^\top H = I
+#        ..math: d_t^\top = \[0 \cdots 0 1 -1 0 \cdots 0 \]
+#        """
+#        MAX_ITER = 1000
+#        ABSTOL   = 1e-4
+#        RELTOL   = 1e-2
+#        
+#        self.vect_len_ts = vect_len_ts
+#        
+#        # Saving state
+#        h = {}
+#        h['objval']     = np.zeros(MAX_ITER)
+#        h['r_norm']     = np.zeros(MAX_ITER)
+#        h['s_norm']     = np.zeros(MAX_ITER)
+#        h['eps_pri']    = np.zeros(MAX_ITER)
+#        h['eps_dual']   = np.zeros(MAX_ITER)
+#        
+#        if self.verbose:
+#            print('{}\t{}\t{}\t{}\t{}\t{}\n'.
+#                  format('iter','r norm', 'eps pri', 's norm', 'eps dual', 'objective'))
+#        
+#        # to form the differentiation matrix
+#        diags = np.array([0, -1])
+#        
+#        # vect containing respective lengths of Y and W
+#        vect_size_tv = vect_len_ts - 1
+#        
+#        # kappa: proximal parameter
+#        kappa = self.reg_param/self.admm_rho
+#        
+#        # constants for stopping tolerance
+#        c_prim = np.sqrt(self.n_clusters*vect_len_ts.sum())
+#        c_dual = np.sqrt(self.n_clusters*vect_size_tv.sum())
+#        
+#        for k in range(MAX_ITER):
+#            
+#            W = self.W
+#            Y = self.Y
+#            rho = self.admm_rho
+#            def Hstep_cost_function(H):
+#                """
+#                cost function used by pymanopt to solve the stiefel manifold problem
+#                ..math: \min_H - trace(H^\top*K*H) + \frac{\rho}{2}  \|H^\top D - W + Y \|_F^2
+#                ..math: s.t. H^\top H = I
+#                """
+#                
+#                # cost function
+#                cost = -np.trace((H.T)@K@H)
+#                
+#                # to form the differentiation matrix
+#                diags = np.array([0, -1])
+#                ndata = 0
+#                n_size_tv = 0
+#                for i, len_ts in enumerate(vect_len_ts):
+#                        
+#                    index = np.arange(n_size_tv, vect_size_tv[:i+1].sum())
+#                    e = np.ones(len_ts)
+#                    Dl = spdiags(np.vstack((e, -e)), diags, len_ts, len_ts-1)
+#                    Hl_top_times_Dl = np.transpose(H[ndata:vect_len_ts[:i+1].sum(), :])@Dl
+#                    U_ell = Hl_top_times_Dl - W[:, index] + Y[:, index]
+#                           
+#                    cost += rho*norm(U_ell, 'fro')/2
+#                    
+#                    n_size_tv += vect_size_tv[i]
+#                    ndata += vect_len_ts[i]
+#                
+#                return cost
+#    
+#            
+#            # ================ H-Update =============
+#            manifold = Stiefel(vect_len_ts.sum(), self.n_clusters)
+#            problem = Problem(manifold=manifold, cost=Hstep_cost_function)
+#
+#            solver = SteepestDescent() #instantiation pymanopt
+#
+#            self.H = np.asarray(solver.solve(problem))
+#            
+#            # ================ W and Y -Updates =============
+#            # Variables W of ADMM
+#            Wold = self.W
+#            
+#            ndata = 0
+#            n_size_tv = 0
+#            h['r_norm'][k] = 0      #history primal residual norm 
+#            h['s_norm'][k] = 0      #history dual residual norm 
+#            norm_Htop_D    = 0
+#            norm_D_Ytop    = 0
+#            
+#            for i, len_ts in enumerate(vect_len_ts):
+#                
+#                index = np.arange(n_size_tv, vect_size_tv[:i+1].sum())
+#                
+#                e = np.ones(len_ts)
+#                Dl = spdiags(np.vstack((e, -e)), diags, len_ts, len_ts-1)
+#                Hl_top_times_Dl = np.transpose(self.H[ndata:vect_len_ts[:i+1].sum(), :])@Dl
+#                target_ell = Hl_top_times_Dl + self.Y[:, index]
+#                
+#                
+#                # ==== W-Update for signal i =======
+#                self.W[:,index] = self._soft_shrinkage(target_ell, kappa)
+#                
+#                # ===== Y-Update for signal i =======
+#                self.Y[:, index] = self.Y[:,index] + (Hl_top_times_Dl - self.W[:,index])
+#                
+#                # ===== update residual norm accordingly ======
+#                h['r_norm'][k] += np.linalg.norm(Hl_top_times_Dl - self.W[:,index], 'fro')
+#                auxM = Dl @ np.transpose(Wold[:,index] - self.W[:,index])
+#                
+#                h['s_norm'][k] += self.admm_rho*norm(auxM, 'fro')
+#                
+#                norm_Htop_D += norm(Hl_top_times_Dl, 'fro')
+#                
+#                norm_D_Ytop += self.admm_rho*norm(Dl@np.transpose(self.Y[:, index]), 'fro')
+#                
+#                n_size_tv += vect_size_tv[i]
+#                ndata += vect_len_ts[i]
+#                
+#            
+#            # History
+#            h['objval'][k]   = self._objective_function(self, K, vect_len_ts)
+#            h['eps_pri'][k]  = c_prim*ABSTOL + RELTOL*np.max([norm(self.W, 'fro'), norm_Htop_D])
+#            h['eps_dual'][k] = c_dual*ABSTOL + RELTOL*norm_D_Ytop
+#            
+#            # verbose
+#            if self.verbose:
+#                print('{}\t{}\t{}\t{}\t{}\t{}\n'.format(k, h['r_norm'][k], h['eps_pri'][k],
+#                      h['s_norm'][k], h['eps_dual'][k], h['objval'][k]))
+#                
+#            # check convergence
+#            if (h['r_norm'][k] < h['eps_pri'][k]) and (h['s_norm'][k] < h['eps_dual'][k]):
+#                break
+#            
+#        self.history = h
+#        return self
+        
+#%%
+#def _objective_function(self, K, vect_len_ts):
+#        """
+#        inputs:
+#            K: kernel matrix (pairwise similarity distance matrix)
+#            vect_lens_ts: vector which elements delineate batches of time series
+#        outputs: 
+#            obj_val: objective value J(H)
+#            ..math: J(H) = tr(K) - tr(H H^\top K) + \frac{\lambda}{n_0} \sum_{t=1}^{T-1}\|H^\top d_t \|_1
+#            ..math: d_t^\top = \[0 \cdots 0 1 -1 0 \cdots 0 \] 
+#        """
+#        diags = np.array([0, -1])
+#        ell = 1  # ell-norm
+#        obj_val = np.trace(K) - np.trace(self.H@(self.H.transpose()@K))
+#        ndata = 0
+#        for i, len_ts in enumerate(vect_len_ts):
+#            e = np.ones(len_ts)
+#            Dl = spdiags(np.vstack((e, -e)), diags, len_ts, len_ts-1)
+#            Hl_top_times_Dl = np.transpose(self.H[ndata:vect_len_ts[:i+1].sum(), :])@Dl
+#            obj_val += self._columwise_norm(Hl_top_times_Dl, ell)
+#            ndata += vect_len_ts[i]
+#            
+#        return obj_val
+#    
